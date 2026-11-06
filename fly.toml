@@ -1,0 +1,47 @@
+# Fly.io config. Replace the app name and region before `fly launch` / `fly deploy`.
+# S3 credentials are NOT stored here; set them with `fly secrets set` (see README.md).
+
+app = "my-audiobookshelf"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+  [build.args]
+    ABS_IMAGE = "ghcr.io/advplyr/audiobookshelf:2.19.0"
+    RCLONE_IMAGE = "rclone/rclone:1.76.0"
+
+[env]
+  # Non-secret S3 settings. Change the provider/endpoint to match your storage.
+  S3_PROVIDER = "Cloudflare"          # Cloudflare (R2), Other (B2 S3 API, Tigris, ...), AWS, Minio
+  S3_REGION = "auto"                  # R2: auto. B2: region from the endpoint, e.g. us-west-004. AWS: e.g. us-east-1
+  # S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY are secrets.
+  # S3_PREFIX = "audiobooks"          # optional: only mount this folder of the bucket
+
+  # Persistent state on the volume below.
+  CONFIG_PATH = "/data/config"
+  METADATA_PATH = "/data/metadata"
+  CACHE_DIR = "/data/rclone-cache"
+
+  # Read cache for audiobook files. Keep VFS_CACHE_MAX_SIZE well below the volume size.
+  VFS_CACHE_MODE = "full"
+  VFS_CACHE_MAX_SIZE = "5G"
+  DIR_CACHE_TIME = "5m"
+
+[[mounts]]
+  source = "abs_data"
+  destination = "/data"
+  initial_size = "20gb"
+
+[http_service]
+  internal_port = 80
+  force_https = true
+  # Keep one machine running. The volume is attached to one machine, and
+  # stopping it would interrupt playback.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
