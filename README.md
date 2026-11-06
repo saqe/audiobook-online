@@ -1,0 +1,159 @@
+# Audiobookshelf on Fly.io with audiobooks in S3-compatible storage
+
+This repo wraps the public [Audiobookshelf](https://github.com/advplyr/audiobookshelf) image so that:
+
+- **Audiobooks stay in S3-compatible storage** (Cloudflare R2, Backblaze B2, Tigris, AWS S3, MinIO, ...). Nothing is copied at startup.
+- **The bucket is mounted read-only** at `/audiobooks` with rclone FUSE. The mount acts as the link: files are fetched from the bucket when they are played, and recently used files are kept in a bounded cache on the volume.
+- **Metadata and config live on one Fly volume** at `/data` (Audiobookshelf's database, covers, and settings).
+
+## How it works
+
+```
+Fly machine
+├── tini                       PID 1: signal handling
+└── start.sh
+    ├── rclone lsf             checks the bucket, endpoint, and key before mounting
+    ├── rclone mount (ro)      s3://bucket/[prefix]  ->  /audiobooks
+    │                          cache: /data/rclone-cache (bounded, on the volume)
+    └── node index.js          Audiobookshelf, reads /audiobooks and /data/*
+```
+
+- **Read-only.** The mount is `--read-only`, and the S3 key only needs read access. Audiobookshelf cannot modify or delete your books.
+- **Fail-fast.** If the endpoint, bucket, prefix, or key is wrong, the machine exits with a clear error instead of starting with an empty library.
+- **Self-healing.** If the mount dies, Audiobookshelf is stopped so Fly restarts the machine and remounts.
+- **Credentials stay out of the app.** S3 secrets are unset before Audiobookshelf starts.
+
+## Why a mount instead of syncing or symlinks
+
+- Copying the bucket at boot would make start-up time grow with the library and need a volume as large as the whole library.
+- A symlink can't point at S3 by itself. Something has to present the bucket as a filesystem, and FUSE is that layer. The mount is the single "link" for the whole bucket, so no per-file links are needed.
+- Lazy reads plus a bounded cache give fast restarts, and the volume only holds what you have recently listened to.
+
+## Deploy to Fly.io
+
+### 1. Create the bucket and a read-only key
+
+Create a bucket (for example `audiobooks`) with a folder layout Audiobookshelf understands:
+
+```
+audiobooks/
+  Author Name/
+    Book Title/
+      01.m4b
+      cover.jpg
+```
+
+Create an access key that can **read and list only that bucket**. Settings for each provider are in the table below.
+
+### 2. Create the app and volume
+
+```sh
+fly launch --copy-config --no-deploy     # keeps this fly.toml; choose a unique app name
+fly volumes create abs_data --region iad --size 20   # use the same region as primary_region
+```
+
+### 3. Set the S3 secrets
+
+```sh
+fly secrets set \
+  S3_ENDPOINT="https://<account-id>.r2.cloudflarestorage.com" \
+  S3_BUCKET="audiobooks" \
+  S3_ACCESS_KEY_ID="..." \
+  S3_SECRET_ACCESS_KEY="..."
+```
+
+Set `S3_PROVIDER` and `S3_REGION` in `fly.toml` to match your provider (table below). Add `S3_PREFIX` as a secret or in `fly.toml` if you only want one folder of the bucket.
+
+### 4. Deploy
+
+```sh
+fly deploy
+```
+
+Open `https://<app>.fly.dev`, create the admin user, then add a library:
+
+- **Folder:** `/audiobooks`
+- **Watch for changes:** off, if your version shows this option. Changes in S3 don't generate filesystem events, so use **Scan** instead.
+- **Store metadata with item:** off, if your version shows this option. Keep metadata on the volume, because `/audiobooks` is read-only.
+
+Re-run **Scan** after you upload new books to the bucket.
+
+### Provider settings
+
+| Provider | `S3_PROVIDER` | `S3_ENDPOINT` | `S3_REGION` |
+|---|---|---|---|
+| Cloudflare R2 | `Cloudflare` | `https://<account-id>.r2.cloudflarestorage.com` | `auto` |
+| Backblaze B2 (S3 API) | `Other` | `https://s3.<region>.backblazeb2.com` | `<region>`, e.g. `us-west-004` |
+| Tigris (Fly's S3) | `Other` | `https://fly.storage.tigris.dev` | `auto` |
+| AWS S3 | `AWS` | `https://s3.<region>.amazonaws.com` | `<region>` |
+| MinIO / other | `Minio` or `Other` | your endpoint URL | `us-east-1` or your region |
+
+Use the read-only key for each provider: R2 "Object Read" token, B2 application key limited to the bucket with read-only capabilities, or an IAM policy with `s3:GetObject` and `s3:ListBucket`.
+
+## Configuration
+
+Set these as Fly secrets (credentials) or in `fly.toml` `[env]` (everything else).
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `S3_ENDPOINT` | yes | | S3 API endpoint URL |
+| `S3_BUCKET` | yes | | Bucket name |
+| `S3_ACCESS_KEY_ID` | yes | | Read-only key ID (secret) |
+| `S3_SECRET_ACCESS_KEY` | yes | | Read-only key secret (secret) |
+| `S3_PROVIDER` | no | `Other` | rclone provider name (see table) |
+| `S3_REGION` | no | `auto` | Region |
+| `S3_PREFIX` | no | (bucket root) | Mount only this folder of the bucket |
+| `MOUNT_POINT` | no | `/audiobooks` | Where the bucket appears |
+| `VFS_CACHE_MODE` | no | `full` | `full` caches whole files on the volume. `off` streams without caching |
+| `VFS_CACHE_MAX_SIZE` | no | `5G` | Cache size cap. Keep it well below the volume size |
+| `DIR_CACHE_TIME` | no | `5m` | How long directory listings are cached before re-reading the bucket |
+| `CACHE_DIR` | no | `/data/rclone-cache` | Cache location (on the volume) |
+| `CONFIG_PATH` | (set in image) | `/data/config` | Audiobookshelf config |
+| `METADATA_PATH` | (set in image) | `/data/metadata` | Audiobookshelf metadata and covers |
+
+Sizing: the volume holds Audiobookshelf's database and metadata, plus the cache. Set `initial_size` in `fly.toml` (default 20 GB) to be at least `VFS_CACHE_MAX_SIZE` plus a few GB. Volumes can be extended later with `fly volumes extend`.
+
+## Test locally first
+
+The compose file runs an rclone S3 server as a stand-in bucket, so you can test without cloud credentials or cost.
+
+```sh
+mkdir -p local-bucket/audiobooks/"Author One"/"Book A"
+cp some-book.m4b local-bucket/audiobooks/"Author One"/"Book A"/01.m4b
+docker compose up --build
+```
+
+Then open http://localhost:8080 and add `/audiobooks` as a library. Local testing needs Docker with FUSE access, which the compose file grants with `/dev/fuse`, `SYS_ADMIN`, and `apparmor:unconfined`.
+
+## Checks before going live
+
+1. **FUSE on Fly.** After the first deploy, confirm the device exists and the mount works:
+   ```sh
+   fly ssh console -C "ls -l /dev/fuse"
+   fly logs    # look for: [start] mounted /audiobooks
+   ```
+   If `/dev/fuse` is missing or the mount fails on Fly, the wrapper exits with a clear error. The fallback is to sync the bucket to the volume instead, which is slower to start and needs a volume as large as the library.
+2. **Image pins.** `fly.toml` pins `ghcr.io/advplyr/audiobookshelf:2.19.0` and `rclone/rclone:1.76.0`. Before you upgrade Audiobookshelf, check its start command against the new image:
+   ```sh
+   docker inspect ghcr.io/advplyr/audiobookshelf:<tag> --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}'
+   ```
+   If the Cmd differs from `node /usr/src/app/index.js`, update the `CMD` line in the Dockerfile.
+3. **Base image OS.** The Dockerfile installs `fuse3`, `tini`, and `ca-certificates` with `apk` or `apt-get`, whichever the base image has. It fails the build on any other base image.
+
+## Operational notes
+
+- **One machine.** The volume is attached to a single machine, and Audiobookshelf uses an SQLite database, so don't scale beyond one machine.
+- **`auto_stop_machines` is off** so playback isn't interrupted. Set it to `"stop"` in `fly.toml` and `min_machines_running = 0` if you want to save money when idle, at the cost of a cold start.
+- **Cache behaviour.** With `VFS_CACHE_MODE=full`, a file is downloaded to the cache on first access, so the first play of a large book takes longer and later plays are served locally. Use `off` to stream every time, which costs more S3 requests and bandwidth.
+- **Reads from S3 cost money** on some providers (per request on S3, per download on B2 beyond the free tier). Cloudflare R2 has no egress fees.
+- **Updates.** Add new books to the bucket, then run **Scan** in Audiobookshelf. Directory listings are cached for `DIR_CACHE_TIME`, so new folders can take up to that long to appear.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `Dockerfile` | Builds Audiobookshelf + rclone + FUSE + tini |
+| `start.sh` | Checks S3 access, mounts the bucket read-only, runs Audiobookshelf, handles shutdown |
+| `fly.toml` | Fly app config: volume, env, HTTP service, VM size |
+| `docker-compose.yml` | Local test rig with an rclone S3 stand-in |
+| `.dockerignore` | Keeps secrets and git data out of the image |

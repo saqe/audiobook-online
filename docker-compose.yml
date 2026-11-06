@@ -1,0 +1,38 @@
+# Local test rig. An rclone S3 server stands in for R2 / B2 / S3, and the app
+# container gets the same FUSE mount it would get on Fly.
+#   1. Put test books in ./local-bucket/audiobooks/<Author>/<Book>/...
+#   2. docker compose up --build
+#   3. Open http://localhost:8080 and add /audiobooks as a library folder.
+services:
+  s3:
+    image: rclone/rclone:1.76.0
+    command: serve s3 /data --addr :9000 --auth-key minioadmin,minioadmin
+    volumes:
+      - ./local-bucket:/data
+    ports:
+      - "9000:9000"
+
+  abs:
+    build: .
+    depends_on:
+      - s3
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      S3_PROVIDER: Other
+      S3_ENDPOINT: http://s3:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: audiobooks
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    volumes:
+      - abs-data:/data
+    ports:
+      - "8080:80"
+
+volumes:
+  abs-data:
