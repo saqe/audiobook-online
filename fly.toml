@@ -10,9 +10,11 @@ swap_size_mb = 512
 [build]
   dockerfile = "Dockerfile"
 
+  # Pinned by digest; keep in sync with the Dockerfile ARGs.
   [build.args]
-    ABS_IMAGE = "ghcr.io/advplyr/audiobookshelf:2.37.2"
-    RCLONE_IMAGE = "rclone/rclone:1.76.0"
+    ABS_IMAGE = "ghcr.io/advplyr/audiobookshelf:2.37.2@sha256:b897c33f05972fb1bf484f7487bc878fa91ec8691335c1db6e2929c3a7658efa"
+    RCLONE_IMAGE = "rclone/rclone:1.76.0@sha256:7cbeec24a44f206067597c0368be4de90ae19a64d5113c7d1938bd737a81e466"
+    TAILSCALE_IMAGE = "tailscale/tailscale:v1.104.4@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c"
 
 [env]
   # Non-secret S3 settings. Change the provider/endpoint to match your storage.
