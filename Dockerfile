@@ -3,10 +3,12 @@
 # Build args let you pin versions without editing this file:
 #   ABS_IMAGE    the upstream Audiobookshelf image
 #   RCLONE_IMAGE the rclone image; only its static /usr/local/bin/rclone binary is used
-ARG ABS_IMAGE=ghcr.io/advplyr/audiobookshelf:2.19.0
+ARG ABS_IMAGE=ghcr.io/advplyr/audiobookshelf:2.37.2
 ARG RCLONE_IMAGE=rclone/rclone:1.76.0
+ARG TAILSCALE_IMAGE=tailscale/tailscale:v1.104.4
 
 FROM ${RCLONE_IMAGE} AS rclone
+FROM ${TAILSCALE_IMAGE} AS tailscale
 
 FROM ${ABS_IMAGE}
 
@@ -27,6 +29,8 @@ RUN set -eux; \
     echo "user_allow_other" >> /etc/fuse.conf
 
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
+COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
+COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscaled
 COPY start.sh /usr/local/bin/start.sh
 RUN chmod 0755 /usr/local/bin/start.sh && rclone version
 
@@ -40,6 +44,7 @@ ENV CONFIG_PATH=/data/config \
 EXPOSE 80
 
 ENTRYPOINT ["/usr/local/bin/tini", "--", "/usr/local/bin/start.sh"]
-# Start command for Audiobookshelf. Confirm it against the pinned image with:
-#   docker inspect ghcr.io/advplyr/audiobookshelf:2.19.0 --format '{{json .Config.Cmd}} {{json .Config.Entrypoint}}'
-CMD ["node", "/usr/src/app/index.js"]
+# Start command for Audiobookshelf (run from the image's WORKDIR, /app on 2.37.x).
+# Confirm it against the pinned image with:
+#   docker inspect ghcr.io/advplyr/audiobookshelf:2.37.2 --format '{{json .Config.Cmd}} {{json .Config.Entrypoint}} {{json .Config.WorkingDir}}'
+CMD ["node", "dist-server/index.js"]

@@ -14,6 +14,7 @@ die() { printf '[start] ERROR: %s\n' "$*" >&2; exit 1; }
 : "${S3_ENDPOINT:?set S3_ENDPOINT, e.g. https://<account-id>.r2.cloudflarestorage.com}"
 : "${S3_ACCESS_KEY_ID:?set S3_ACCESS_KEY_ID}"
 : "${S3_SECRET_ACCESS_KEY:?set S3_SECRET_ACCESS_KEY}"
+: "${TS_AUTHKEY:?set TS_AUTHKEY (a Tailscale auth key). Without it the app is unreachable}"
 [ "$#" -gt 0 ] || die "no command given to run after the mount"
 
 S3_PREFIX="${S3_PREFIX:-}"             # optional folder inside the bucket
@@ -79,6 +80,37 @@ log "mounted $MOUNT_POINT"
 # so the application process does not inherit them.
 unset RCLONE_S3_ACCESS_KEY_ID RCLONE_S3_SECRET_ACCESS_KEY S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY
 
+# --- Tailscale: the app is reachable only from your tailnet -------------------
+# The Fly app has no public service, so the only way in is over Tailscale. Without
+# a key the app would run unreachable, so refuse to start.
+TS_HOSTNAME="${TS_HOSTNAME:-audiobookshelf}"
+TS_SOCK=/var/run/tailscale/tailscaled.sock
+TS_PID=""
+mkdir -p /var/run/tailscale /data/tailscale
+
+# Userspace networking needs no TUN device or extra capabilities. The node
+# identity lives on the volume, so a redeploy keeps the same tailnet machine.
+log "starting tailscaled (hostname $TS_HOSTNAME)"
+tailscaled --tun=userspace-networking --statedir=/data/tailscale --socket="$TS_SOCK" &
+TS_PID=$!
+i=0
+until [ -S "$TS_SOCK" ]; do
+  kill -0 "$TS_PID" 2>/dev/null || die "tailscaled exited during startup"
+  i=$((i + 1))
+  [ "$i" -gt 30 ] && die "timed out waiting for tailscaled"
+  sleep 1
+done
+tailscale --socket="$TS_SOCK" up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" \
+  || die "tailscale up failed. Check TS_AUTHKEY (expired or already used?)"
+# Serve the app on the tailnet only. Clear any serve config saved on the volume
+# first, because a leftover rule (HTTP or TCP) makes the next serve command fail.
+# TCP forwarding passes the request through unchanged, so the tailnet IP works too.
+tailscale --socket="$TS_SOCK" serve reset >/dev/null 2>&1 || true
+tailscale --socket="$TS_SOCK" serve --bg --tcp=80 tcp://127.0.0.1:80 \
+  || die "tailscale serve failed"
+log "tailnet: reachable as http://$TS_HOSTNAME (MagicDNS) on port 80"
+unset TS_AUTHKEY
+
 APP_PID=""
 WATCH_PID=""
 
@@ -89,6 +121,7 @@ stop() {
     kill -TERM "$APP_PID" 2>/dev/null || true
     wait "$APP_PID" 2>/dev/null || true
   fi
+  if [ -n "$TS_PID" ]; then kill -TERM "$TS_PID" 2>/dev/null || true; fi
   # SIGTERM makes rclone unmount cleanly before it exits.
   kill -TERM "$RCLONE_PID" 2>/dev/null || true
   wait "$RCLONE_PID" 2>/dev/null || true

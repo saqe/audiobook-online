@@ -1,0 +1,53 @@
+name: Docker build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint start.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: POSIX syntax check
+        run: sh -n start.sh
+
+      - name: ShellCheck
+        run: shellcheck start.sh
+
+  build:
+    name: Build image and smoke test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t abs-s3:ci .
+
+      - name: Check required tools are in the image
+        run: |
+          docker run --rm --entrypoint sh abs-s3:ci -c '
+            set -e
+            command -v rclone
+            command -v tini
+            command -v tailscale
+            command -v tailscaled
+            command -v fusermount3 || command -v fusermount
+            rclone version
+            test -x /usr/local/bin/start.sh
+            test -f /app/dist-server/index.js   # Audiobookshelf entry point (CMD runs it from /app)
+            grep -q user_allow_other /etc/fuse.conf
+          '
+
+      - name: Check the entrypoint and CMD are set
+        run: |
+          docker image inspect abs-s3:ci --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' \
+            | tee /dev/stderr \
+            | grep -q 'start.sh'

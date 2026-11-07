@@ -1,14 +1,14 @@
 # Fly.io config. Replace the app name and region before `fly launch` / `fly deploy`.
 # S3 credentials are NOT stored here; set them with `fly secrets set` (see README.md).
 
-app = "my-audiobookshelf"
-primary_region = "iad"
+app = "saqib-audiobookshelf"
+primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"
 
   [build.args]
-    ABS_IMAGE = "ghcr.io/advplyr/audiobookshelf:2.19.0"
+    ABS_IMAGE = "ghcr.io/advplyr/audiobookshelf:2.37.2"
     RCLONE_IMAGE = "rclone/rclone:1.76.0"
 
 [env]
@@ -23,25 +23,24 @@ primary_region = "iad"
   METADATA_PATH = "/data/metadata"
   CACHE_DIR = "/data/rclone-cache"
 
-  # Read cache for audiobook files. Keep VFS_CACHE_MAX_SIZE well below the volume size.
-  VFS_CACHE_MODE = "full"
-  VFS_CACHE_MAX_SIZE = "5G"
+  # Name of this app's machine on your tailnet. TS_AUTHKEY is a secret (see README).
+  TS_HOSTNAME = "audiobookshelf"
+
+  # Audio is streamed from S3 and never stored on the volume (VFS_CACHE_MODE=off).
+  # The volume only holds the database, config, and cover images.
+  VFS_CACHE_MODE = "off"
   DIR_CACHE_TIME = "5m"
 
 [[mounts]]
   source = "abs_data"
   destination = "/data"
-  initial_size = "20gb"
+  initial_size = "1gb"
 
-[http_service]
-  internal_port = 80
-  force_https = true
-  # Keep one machine running. The volume is attached to one machine, and
-  # stopping it would interrupt playback.
-  auto_stop_machines = "off"
-  auto_start_machines = true
-  min_machines_running = 1
+# No [http_service]: the app has no public address. It is reachable only over
+# Tailscale (see README.md, "Private access with Tailscale"). Keep one machine
+# running: the volume is attached to one machine, and stopping it would
+# interrupt playback.
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "1gb"
+  memory = "256mb"
