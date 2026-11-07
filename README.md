@@ -49,7 +49,7 @@ Create an access key that can **read and list only that bucket**. Settings for e
 
 ```sh
 fly launch --copy-config --no-deploy     # keeps this fly.toml; choose a unique app name
-fly volumes create abs_data --region iad --size 20   # use the same region as primary_region
+fly volumes create abs_data --region sin --size 1   # use the same region as primary_region; 1 GB is enough, see Sizing
 ```
 
 ### 3. Set the S3 secrets
@@ -70,7 +70,9 @@ Set `S3_PROVIDER` and `S3_REGION` in `fly.toml` to match your provider (table be
 fly deploy
 ```
 
-Open `https://<app>.fly.dev`, create the admin user, then add a library:
+**Redeploys keep your data.** The database, config, and covers live on the `abs_data` volume, and `fly deploy` reattaches that same volume to the new machine. Only these actions remove data: `fly volumes destroy`, `fly apps destroy`, or changing `source` in `[[mounts]]` (which creates a new, empty volume). Don't run `fly launch` again on an existing app, since it can create a new app and volume. Audio is never on the volume, so it isn't affected either way.
+
+The app has no public address, so open it from a device on your tailnet at `http://audiobookshelf` (or the hostname you set in `TS_HOSTNAME`). Create the admin user, then add a library:
 
 - **Folder:** `/audiobooks`
 - **Watch for changes:** off, if your version shows this option. Changes in S3 don't generate filesystem events, so use **Scan** instead.
@@ -104,14 +106,30 @@ Set these as Fly secrets (credentials) or in `fly.toml` `[env]` (everything else
 | `S3_REGION` | no | `auto` | Region |
 | `S3_PREFIX` | no | (bucket root) | Mount only this folder of the bucket |
 | `MOUNT_POINT` | no | `/audiobooks` | Where the bucket appears |
-| `VFS_CACHE_MODE` | no | `full` | `full` caches whole files on the volume. `off` streams without caching |
-| `VFS_CACHE_MAX_SIZE` | no | `5G` | Cache size cap. Keep it well below the volume size |
+| `VFS_CACHE_MODE` | no | `off` | `off` streams audio from S3 and stores nothing on the volume. `full` caches whole files on the volume (uses volume space) |
+| `VFS_CACHE_MAX_SIZE` | no | `5G` | Cache size cap. Only used when `VFS_CACHE_MODE=full` |
 | `DIR_CACHE_TIME` | no | `5m` | How long directory listings are cached before re-reading the bucket |
 | `CACHE_DIR` | no | `/data/rclone-cache` | Cache location (on the volume) |
 | `CONFIG_PATH` | (set in image) | `/data/config` | Audiobookshelf config |
 | `METADATA_PATH` | (set in image) | `/data/metadata` | Audiobookshelf metadata and covers |
 
-Sizing: the volume holds Audiobookshelf's database and metadata, plus the cache. Set `initial_size` in `fly.toml` (default 20 GB) to be at least `VFS_CACHE_MAX_SIZE` plus a few GB. Volumes can be extended later with `fly volumes extend`.
+Sizing: with `VFS_CACHE_MODE=off` the volume holds only Audiobookshelf's database, config, and cover images. Audio files stay in S3. In testing, the database, config, and metadata used about 0.5 MB. `initial_size = "1gb"` in `fly.toml` leaves plenty of room for a large library's covers. Volumes can be extended later with `fly volumes extend`, but they can't be shrunk, so start small.
+
+## Private access with Tailscale
+
+The Fly app has no public service. Only devices signed in to your tailnet can reach it. Tailscale runs inside the same container, and `start.sh` refuses to start without a key.
+
+1. **Create an auth key.** In the Tailscale admin console, go to Settings → Keys → Generate auth key. A single-use key is enough, because the machine keeps its identity on the volume (`/data/tailscale`) and redeploys reuse it.
+2. **Store the key as a Fly secret.** Don't put it in the repo, `fly.toml`, the Dockerfile, or GitHub. Run `fly secrets set TS_AUTHKEY=tskey-auth-...` once. Fly keeps it and passes it to the machine on every deploy.
+3. **Deploy:** `fly deploy`.
+4. **Connect a device.** Install Tailscale on your phone or laptop, sign in to the same tailnet, and open `http://audiobookshelf` (or your `TS_HOSTNAME`).
+
+With the device disconnected from the tailnet, the app is unreachable from the internet.
+
+Checks:
+- `fly logs` should show `tailnet: reachable as http://audiobookshelf`.
+- If the key is expired or already used, `start.sh` exits with `tailscale up failed`. Create a new key and run `fly secrets set` again.
+- Memory: tailscaled adds to the 256 MB limit. After the first deploy, watch for restarts with `fly status` and for out-of-memory messages in `fly logs`.
 
 ## Test locally first
 
@@ -137,14 +155,14 @@ Then open http://localhost:8080 and add `/audiobooks` as a library. Local testin
    ```sh
    docker inspect ghcr.io/advplyr/audiobookshelf:<tag> --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}'
    ```
-   If the Cmd differs from `node /usr/src/app/index.js`, update the `CMD` line in the Dockerfile.
+   If the Cmd differs from `["node","index.js"]` (run from `/`), update the `CMD` line in the Dockerfile.
 3. **Base image OS.** The Dockerfile installs `fuse3`, `tini`, and `ca-certificates` with `apk` or `apt-get`, whichever the base image has. It fails the build on any other base image.
 
 ## Operational notes
 
 - **One machine.** The volume is attached to a single machine, and Audiobookshelf uses an SQLite database, so don't scale beyond one machine.
 - **`auto_stop_machines` is off** so playback isn't interrupted. Set it to `"stop"` in `fly.toml` and `min_machines_running = 0` if you want to save money when idle, at the cost of a cold start.
-- **Cache behaviour.** With `VFS_CACHE_MODE=full`, a file is downloaded to the cache on first access, so the first play of a large book takes longer and later plays are served locally. Use `off` to stream every time, which costs more S3 requests and bandwidth.
+- **Cache behaviour.** The default `VFS_CACHE_MODE=off` streams every play from S3, so no audio is stored on the volume. This costs more S3 requests and bandwidth. Set `full` only if you want played books cached on the volume, and then size the volume to fit `VFS_CACHE_MAX_SIZE`.
 - **Reads from S3 cost money** on some providers (per request on S3, per download on B2 beyond the free tier). Cloudflare R2 has no egress fees.
 - **Updates.** Add new books to the bucket, then run **Scan** in Audiobookshelf. Directory listings are cached for `DIR_CACHE_TIME`, so new folders can take up to that long to appear.
 
