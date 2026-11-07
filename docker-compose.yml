@@ -5,7 +5,7 @@
 #   3. Open http://localhost:8080 and add /audiobooks as a library folder.
 services:
   s3:
-    image: rclone/rclone:1.76.0
+    image: rclone/rclone:1.76.0@sha256:7cbeec24a44f206067597c0368be4de90ae19a64d5113c7d1938bd737a81e466
     command: serve s3 /data --addr :9000 --auth-key minioadmin,minioadmin
     volumes:
       - ./local-bucket:/data
