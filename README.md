@@ -65,54 +65,6 @@ flowchart LR
 
 The machine has no public service and no public IP. The only way in is the Tailscale tunnel.
 
-### Startup
-
-```mermaid
-sequenceDiagram
-    participant F as Fly
-    participant S as start.sh
-    participant R as rclone
-    participant B as S3 bucket
-    participant T as tailscaled
-    participant A as Audiobookshelf
-
-    F->>S: start machine, attach volume at /data
-    S->>S: require S3 settings and TS_AUTHKEY, else exit
-    S->>R: rclone lsf, check access
-    R->>B: list bucket
-    B-->>R: entries or an error
-    R-->>S: ok, else exit with a clear message
-    S->>R: rclone mount, read-only, at /audiobooks
-    S->>S: unset the S3 credentials
-    S->>T: start tailscaled, tailscale up with TS_AUTHKEY
-    S->>T: serve reset, then forward TCP port 80 to 127.0.0.1:80
-    S->>A: node dist-server/index.js
-    Note over S,A: A watcher stops the app if the mount dies, so Fly restarts the machine
-```
-
-### Library scan
-
-```mermaid
-sequenceDiagram
-    actor U as You
-    participant A as Audiobookshelf
-    participant R as rclone mount
-    participant B as S3 bucket
-    participant V as Volume /data
-
-    U->>A: open the library, run Scan
-    A->>R: readdir /audiobooks
-    R->>B: ListObjectsV2, cached for DIR_CACHE_TIME
-    B-->>R: keys, sizes, dates
-    R-->>A: directory entries
-    A->>R: read file headers for tags, duration, cover
-    R->>B: GET with a Range header
-    B-->>R: partial bytes
-    R-->>A: bytes
-    A->>V: save titles, covers, durations in SQLite
-    A-->>U: books appear in the library
-```
-
 ### Playback and seeking
 
 ```mermaid
