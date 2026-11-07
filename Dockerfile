@@ -3,9 +3,17 @@
 # Build args let you pin versions without editing this file:
 #   ABS_IMAGE    the upstream Audiobookshelf image
 #   RCLONE_IMAGE the rclone image; only its static /usr/local/bin/rclone binary is used
-ARG ABS_IMAGE=ghcr.io/advplyr/audiobookshelf:2.37.2
-ARG RCLONE_IMAGE=rclone/rclone:1.76.0
-ARG TAILSCALE_IMAGE=tailscale/tailscale:v1.104.4
+#   TAILSCALE_IMAGE the Tailscale image; only its tailscale and tailscaled binaries are used
+#
+# Each image is pinned by digest. The tag is kept for readability, but Docker
+# pulls by the digest, so a re-pushed tag can't change what gets built. The
+# digests are multi-arch indexes (amd64 for Fly, arm64 for Apple Silicon).
+# To bump a version, get the new digest with:
+#   docker buildx imagetools inspect <image>:<tag>
+# and update it here and in fly.toml [build.args] (and docker-compose.yml for rclone).
+ARG ABS_IMAGE=ghcr.io/advplyr/audiobookshelf:2.37.2@sha256:b897c33f05972fb1bf484f7487bc878fa91ec8691335c1db6e2929c3a7658efa
+ARG RCLONE_IMAGE=rclone/rclone:1.76.0@sha256:7cbeec24a44f206067597c0368be4de90ae19a64d5113c7d1938bd737a81e466
+ARG TAILSCALE_IMAGE=tailscale/tailscale:v1.104.4@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c
 
 FROM ${RCLONE_IMAGE} AS rclone
 FROM ${TAILSCALE_IMAGE} AS tailscale

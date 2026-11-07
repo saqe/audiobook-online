@@ -237,7 +237,7 @@ Open http://localhost:8080 and add `/audiobooks` as a library. Local testing nee
    fly logs    # look for: [start] mounted /audiobooks
    ```
    If the mount fails, the startup script exits with a clear error. The fallback is to sync the bucket to the volume, which is slower to start and needs a volume as large as the library.
-2. **Image versions.** `fly.toml` pins Audiobookshelf 2.37.2 and rclone 1.76.0. The Dockerfile pins Tailscale 1.104.4. Before you upgrade Audiobookshelf, check its start command against the new image:
+2. **Image versions.** The Dockerfile and `fly.toml` pin Audiobookshelf 2.37.2, rclone 1.76.0, and Tailscale 1.104.4, each by tag and digest (`image:tag@sha256:...`). Docker pulls by the digest, so a re-pushed tag can't change the build. To upgrade, get the new digest with `docker buildx imagetools inspect <image>:<tag>`, then update it in the Dockerfile, `fly.toml`, and, for rclone, `docker-compose.yml`. Before you upgrade Audiobookshelf, check its start command against the new image:
    ```sh
    docker inspect ghcr.io/advplyr/audiobookshelf:<tag> --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}} {{json .Config.WorkingDir}}'
    ```
@@ -264,4 +264,5 @@ Open http://localhost:8080 and add `/audiobooks` as a library. Local testing nee
 | `.env.example` | Template for the environment variables. Copy to `.env` (git-ignored) |
 | `.github/workflows/docker-build.yml` | CI: lints `start.sh` and smoke-tests the image |
 | `AGENTS.md` | Guidance for AI agents working in this repo |
+| `SECURITY.md` | How to report a vulnerability, and the security model |
 | `.dockerignore` | Keeps secrets and git data out of the image |
