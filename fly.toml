@@ -4,6 +4,9 @@
 app = "saqib-audiobookshelf"
 primary_region = "sin"
 
+# Swap for the 256 MB machine. Must be a top-level key; inside [[vm]] Fly ignores it.
+swap_size_mb = 512
+
 [build]
   dockerfile = "Dockerfile"
 
