@@ -1,38 +1,37 @@
-# Audiobookshelf on Fly.io with audiobooks in S3-compatible storage
+# Audiobookshelf on Fly.io, with audiobooks in S3
 
-This repo wraps the public [Audiobookshelf](https://github.com/advplyr/audiobookshelf) image so that:
+This repo runs [Audiobookshelf](https://github.com/advplyr/audiobookshelf) on a small Fly.io machine. Your audiobooks stay in an S3 bucket and are never copied to the server. The app is private: only devices on your Tailscale network can open it.
 
-- **Audiobooks stay in S3-compatible storage** (Cloudflare R2, Backblaze B2, Tigris, AWS S3, MinIO, ...). Nothing is copied at startup.
-- **The bucket is mounted read-only** at `/audiobooks` with rclone FUSE. The mount acts as the link: files are fetched from the bucket when they are played. By default nothing is cached on the volume (`VFS_CACHE_MODE=off`).
-- **Metadata and config live on one Fly volume** at `/data` (Audiobookshelf's database, covers, and settings).
-- **The app is private.** It has no public address and is reachable only over your Tailscale network.
+## How it fits together
 
-## How it works
+- **Audio stays in S3.** The bucket is mounted read-only at `/audiobooks`, so Audiobookshelf reads files as if they were on disk. Audio is streamed from S3 when played and is not stored on the server.
+- **The server keeps only small files.** Audiobookshelf's database, settings, and cover images live on a 1 GB Fly volume at `/data`.
+- **Access is private.** The app has no public address. Tailscale runs in the same container, and you reach the app through your tailnet.
 
 ```
 Fly machine
-├── tini                       PID 1: signal handling
+├── tini                              process manager (PID 1)
 └── start.sh
-    ├── rclone lsf             checks the bucket, endpoint, and key before mounting
-    ├── rclone mount (ro)      s3://bucket/[prefix]  ->  /audiobooks
-    ├── tailscaled + serve     joins the tailnet, forwards TCP :80 to the app
-    └── node dist-server/index.js   Audiobookshelf, reads /audiobooks and /data/*
+    ├── rclone lsf                    checks the bucket, endpoint, and key
+    ├── rclone mount (read-only)      S3 bucket  ->  /audiobooks
+    ├── tailscaled + serve            joins your tailnet, forwards port 80 to the app
+    └── node dist-server/index.js     Audiobookshelf
 ```
 
-- **Read-only.** The mount is `--read-only`, and the S3 key only needs read access. Audiobookshelf cannot modify or delete your books.
+### Why a mount instead of copying or symlinks
+
+- **Copying the bucket at boot** would make startup slower as the library grows, and the volume would need to be as large as the whole library.
+- **A symlink can't point at S3 on its own.** Something has to present the bucket as a filesystem. FUSE does that, so one mount covers the whole bucket and no per-file links are needed.
+- **A mount starts fast.** Files are fetched only when they are read, and the volume holds only the database and covers.
+
+### Safety
+
+- **Read-only.** The mount is read-only and the S3 key only needs read access. Audiobookshelf can't change or delete your books.
 - **Fail-fast.** If the endpoint, bucket, prefix, or key is wrong, the machine exits with a clear error instead of starting with an empty library.
-- **Self-healing.** If the mount dies, Audiobookshelf is stopped so Fly restarts the machine and remounts.
-- **Credentials stay out of the app.** S3 secrets are unset before Audiobookshelf starts.
+- **Self-healing.** If the mount dies, Audiobookshelf stops, and Fly restarts the machine.
+- **Secrets stay out of the app.** S3 credentials are removed from the environment before Audiobookshelf starts.
 
-## Why a mount instead of syncing or symlinks
-
-- Copying the bucket at boot would make start-up time grow with the library and need a volume as large as the whole library.
-- A symlink can't point at S3 by itself. Something has to present the bucket as a filesystem, and FUSE is that layer. The mount is the single "link" for the whole bucket, so no per-file links are needed.
-- Lazy reads give fast restarts, and the volume holds only the database, config, and covers.
-
-## System design
-
-### Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -63,9 +62,9 @@ flowchart LR
     rclone -->|"S3 API: list, ranged GET"| s3
 ```
 
-The machine has no public service and no public IP. The only way in is the Tailscale tunnel.
+The machine has no public service and no public IP address. The only way in is through the Tailscale tunnel.
 
-### Playback and seeking
+## Playback and seeking
 
 ```mermaid
 sequenceDiagram
@@ -85,21 +84,21 @@ sequenceDiagram
 
 The request shapes above are typical, not captured logs.
 
-### Where data lives
+## Where data lives
 
-| Data | Location | Survives a redeploy |
+| Data | Where | Kept across redeploys? |
 |---|---|---|
-| Audio files | S3 bucket, read-only | Yes, never copied |
-| Database, config, covers | Fly volume `abs_data` at `/data` | Yes |
-| Tailscale node identity | Fly volume, `/data/tailscale` | Yes |
+| Audio files | S3 bucket, read-only | Yes. Never copied. |
+| Database, settings, covers | Fly volume `abs_data`, mounted at `/data` | Yes |
+| Tailscale machine identity | Fly volume, `/data/tailscale` | Yes |
 | Swap | Separate device, 512 MB | Not needed |
 | S3 and Tailscale secrets | Fly secrets | Yes |
 
 ## Deploy to Fly.io
 
-### 1. Create the bucket and a read-only key
+### 1. Prepare the bucket and a read-only key
 
-Create a bucket (for example `audiobooks`) with a folder layout Audiobookshelf understands:
+Create a bucket (for example `audiobooks`) and arrange books by author and title:
 
 ```
 audiobooks/
@@ -109,14 +108,16 @@ audiobooks/
       cover.jpg
 ```
 
-Create an access key that can **read and list only that bucket**. Settings for each provider are in the table below.
+Create an access key that can **read and list only that bucket**. The table under [Provider settings](#provider-settings) shows how to do this for each provider.
 
 ### 2. Create the app and volume
 
 ```sh
 fly launch --copy-config --no-deploy     # keeps this fly.toml; choose a unique app name
-fly volumes create abs_data --region sin --size 1   # use the same region as primary_region; 1 GB is enough, see Sizing
+fly volumes create abs_data --region sin --size 1   # same region as primary_region
 ```
+
+One gigabyte is the smallest volume Fly offers, and it's plenty for the database and covers.
 
 ### 3. Set the S3 secrets
 
@@ -128,78 +129,97 @@ fly secrets set \
   S3_SECRET_ACCESS_KEY="..."
 ```
 
-Set `S3_PROVIDER` and `S3_REGION` in `fly.toml` to match your provider (table below). Add `S3_PREFIX` as a secret or in `fly.toml` if you only want one folder of the bucket.
+Set `S3_PROVIDER` and `S3_REGION` in `fly.toml` to match your provider. To mount only one folder of the bucket, set `S3_PREFIX`.
 
-### 4. Deploy
+### 4. Set up Tailscale, then deploy
+
+Follow [Private access with Tailscale](#private-access-with-tailscale) first, then run:
 
 ```sh
 fly deploy
 ```
 
-**Redeploys keep your data.** The database, config, and covers live on the `abs_data` volume, and `fly deploy` reattaches that same volume to the new machine. Only these actions remove data: `fly volumes destroy`, `fly apps destroy`, or changing `source` in `[[mounts]]` (which creates a new, empty volume). Don't run `fly launch` again on an existing app, since it can create a new app and volume. Audio is never on the volume, so it isn't affected either way.
+### 5. Create the admin account and add a library
 
-The app has no public address, so open it from a device on your tailnet at `http://audiobookshelf` (or the hostname you set in `TS_HOSTNAME`). Create the admin user, then add a library:
+Open the app from a device on your tailnet (see [Private access](#private-access-with-tailscale)). Create the admin account, then add a library:
 
 - **Folder:** `/audiobooks`
-- **Watch for changes:** off, if your version shows this option. Changes in S3 don't generate filesystem events, so use **Scan** instead.
-- **Store metadata with item:** off, if your version shows this option. Keep metadata on the volume, because `/audiobooks` is read-only.
+- **Watch for changes:** off, if your version shows this option. Changes in S3 don't trigger filesystem events, so use **Scan** instead.
+- **Store metadata with item:** off, if your version shows this option. Metadata has to stay on the volume, because `/audiobooks` is read-only.
 
-Re-run **Scan** after you upload new books to the bucket.
+Run **Scan** again after you upload new books to the bucket.
+
+### Redeploys keep your data
+
+The database, settings, and covers live on the `abs_data` volume, and `fly deploy` reattaches that same volume to the new machine. Only these actions delete data:
+
+- `fly volumes destroy`
+- `fly apps destroy`
+- changing `source` in `[[mounts]]`, which creates a new, empty volume
+
+Don't run `fly launch` again on an existing app, because it can create a new app and volume.
 
 ### Provider settings
 
 | Provider | `S3_PROVIDER` | `S3_ENDPOINT` | `S3_REGION` |
 |---|---|---|---|
 | Cloudflare R2 | `Cloudflare` | `https://<account-id>.r2.cloudflarestorage.com` | `auto` |
-| Backblaze B2 (S3 API) | `Other` | `https://s3.<region>.backblazeb2.com` | `<region>`, e.g. `us-west-004` |
+| Backblaze B2 (S3 API) | `Other` | `https://s3.<region>.backblazeb2.com` | `<region>`, for example `us-west-004` |
 | Tigris (Fly's S3) | `Other` | `https://fly.storage.tigris.dev` | `auto` |
 | AWS S3 | `AWS` | `https://s3.<region>.amazonaws.com` | `<region>` |
-| MinIO / other | `Minio` or `Other` | your endpoint URL | `us-east-1` or your region |
+| MinIO or other | `Minio` or `Other` | your endpoint URL | `us-east-1` or your region |
 
-Use the read-only key for each provider: R2 "Object Read" token, B2 application key limited to the bucket with read-only capabilities, or an IAM policy with `s3:GetObject` and `s3:ListBucket`.
+Use a read-only key:
+- **Cloudflare R2:** an "Object Read" token.
+- **Backblaze B2:** an application key limited to the bucket, with read-only capabilities.
+- **AWS:** an IAM policy with `s3:GetObject` and `s3:ListBucket`.
+
+## Private access with Tailscale
+
+Only devices signed in to your tailnet can reach the app. `start.sh` refuses to start without a Tailscale key, so the app never runs unreachable.
+
+1. **Create an auth key.** In the Tailscale admin console, go to **Settings → Keys → Generate auth key**. A single-use key is enough. The machine keeps its identity on the volume (`/data/tailscale`), so redeploys reuse it.
+2. **Store the key as a Fly secret.** Don't put it in the repo, `fly.toml`, the Dockerfile, or GitHub:
+   ```sh
+   fly secrets set TS_AUTHKEY=tskey-auth-...
+   ```
+3. **Connect a device.** Install Tailscale on your phone or laptop, sign in to the same tailnet, and keep it connected.
+4. **Open the app** at the machine's MagicDNS name, for example `http://audiobookshelf.<your-tailnet>.ts.net/`. If the name doesn't resolve on a device, use the machine's Tailscale IP address (`tailscale status` lists it).
+
+With Tailscale disconnected, the app can't be reached from the internet.
+
+**Checks:**
+- `fly logs` should show `tailnet: reachable as http://audiobookshelf`.
+- If the key is expired or already used, `start.sh` exits with `tailscale up failed`. Create a new key and run `fly secrets set TS_AUTHKEY=...` again.
 
 ## Configuration
 
-Set these as Fly secrets (credentials) or in `fly.toml` `[env]` (everything else).
+Set credentials as Fly secrets. Set everything else in `fly.toml` under `[env]`.
 
-| Variable | Required | Default | Purpose |
+| Variable | Required | Default | What it does |
 |---|---|---|---|
 | `S3_ENDPOINT` | yes | | S3 API endpoint URL |
 | `S3_BUCKET` | yes | | Bucket name |
 | `S3_ACCESS_KEY_ID` | yes | | Read-only key ID (secret) |
 | `S3_SECRET_ACCESS_KEY` | yes | | Read-only key secret (secret) |
-| `S3_PROVIDER` | no | `Other` | rclone provider name (see table) |
+| `TS_AUTHKEY` | yes | | Tailscale auth key (secret) |
+| `TS_HOSTNAME` | no | `audiobookshelf` | Machine name on your tailnet |
+| `S3_PROVIDER` | no | `Other` | rclone provider name (see the table above) |
 | `S3_REGION` | no | `auto` | Region |
 | `S3_PREFIX` | no | (bucket root) | Mount only this folder of the bucket |
 | `MOUNT_POINT` | no | `/audiobooks` | Where the bucket appears |
-| `VFS_CACHE_MODE` | no | `off` | `off` streams audio from S3 and stores nothing on the volume. `full` caches whole files on the volume (uses volume space) |
+| `VFS_CACHE_MODE` | no | `off` | `off` streams audio from S3 and stores nothing on the volume. `full` caches played files on the volume |
 | `VFS_CACHE_MAX_SIZE` | no | `5G` | Cache size cap. Only used when `VFS_CACHE_MODE=full` |
-| `DIR_CACHE_TIME` | no | `5m` | How long directory listings are cached before re-reading the bucket |
-| `CACHE_DIR` | no | `/data/rclone-cache` | Cache location (on the volume) |
-| `CONFIG_PATH` | (set in image) | `/data/config` | Audiobookshelf config |
-| `METADATA_PATH` | (set in image) | `/data/metadata` | Audiobookshelf metadata and covers |
+| `DIR_CACHE_TIME` | no | `5m` | How long directory listings are cached before rereading the bucket |
+| `CACHE_DIR` | no | `/data/rclone-cache` | Cache location, on the volume |
 
-Sizing: with `VFS_CACHE_MODE=off` the volume holds only Audiobookshelf's database, config, and cover images. Audio files stay in S3. In testing, the database, config, and metadata used about 0.5 MB. `initial_size = "1gb"` in `fly.toml` leaves plenty of room for a large library's covers. Volumes can be extended later with `fly volumes extend`, but they can't be shrunk, so start small.
+Set in the image, you don't need to change these: `CONFIG_PATH=/data/config` and `METADATA_PATH=/data/metadata`.
 
-## Private access with Tailscale
-
-The Fly app has no public service. Only devices signed in to your tailnet can reach it. Tailscale runs inside the same container, and `start.sh` refuses to start without a key.
-
-1. **Create an auth key.** In the Tailscale admin console, go to Settings → Keys → Generate auth key. A single-use key is enough, because the machine keeps its identity on the volume (`/data/tailscale`) and redeploys reuse it.
-2. **Store the key as a Fly secret.** Don't put it in the repo, `fly.toml`, the Dockerfile, or GitHub. Run `fly secrets set TS_AUTHKEY=tskey-auth-...` once. Fly keeps it and passes it to the machine on every deploy.
-3. **Deploy:** `fly deploy`.
-4. **Connect a device.** Install Tailscale on your phone or laptop, sign in to the same tailnet, and open `http://audiobookshelf` (or your `TS_HOSTNAME`).
-
-With the device disconnected from the tailnet, the app is unreachable from the internet.
-
-Checks:
-- `fly logs` should show `tailnet: reachable as http://audiobookshelf`.
-- If the key is expired or already used, `start.sh` exits with `tailscale up failed`. Create a new key and run `fly secrets set` again.
-- Memory: tailscaled adds to the 256 MB limit. After the first deploy, watch for restarts with `fly status` and for out-of-memory messages in `fly logs`.
+**Sizing.** With `VFS_CACHE_MODE=off`, the volume holds only the database, settings, and covers. In testing, that was about 0.5 MB. A 1 GB volume leaves plenty of room. Volumes can grow with `fly volumes extend` but can't shrink, so start small.
 
 ## Test locally first
 
-The compose file runs an rclone S3 server as a stand-in bucket, so you can test without cloud credentials or cost.
+The compose file runs an rclone S3 server as a stand-in bucket, so you can test without cloud accounts.
 
 ```sh
 mkdir -p local-bucket/audiobooks/"Author One"/"Book A"
@@ -207,7 +227,7 @@ cp some-book.m4b local-bucket/audiobooks/"Author One"/"Book A"/01.m4b
 docker compose up --build
 ```
 
-Then open http://localhost:8080 and add `/audiobooks` as a library. Local testing needs Docker with FUSE access, which the compose file grants with `/dev/fuse`, `SYS_ADMIN`, and `apparmor:unconfined`.
+Open http://localhost:8080 and add `/audiobooks` as a library. Local testing needs Docker with FUSE access. The compose file grants it with `/dev/fuse`, `SYS_ADMIN`, and `apparmor:unconfined`.
 
 ## Checks before going live
 
@@ -216,28 +236,32 @@ Then open http://localhost:8080 and add `/audiobooks` as a library. Local testin
    fly ssh console -C "ls -l /dev/fuse"
    fly logs    # look for: [start] mounted /audiobooks
    ```
-   If `/dev/fuse` is missing or the mount fails on Fly, the wrapper exits with a clear error. The fallback is to sync the bucket to the volume instead, which is slower to start and needs a volume as large as the library.
-2. **Image pins.** `fly.toml` pins `ghcr.io/advplyr/audiobookshelf:2.19.0` and `rclone/rclone:1.76.0`. Before you upgrade Audiobookshelf, check its start command against the new image:
+   If the mount fails, the startup script exits with a clear error. The fallback is to sync the bucket to the volume, which is slower to start and needs a volume as large as the library.
+2. **Image versions.** `fly.toml` pins Audiobookshelf 2.37.2 and rclone 1.76.0. The Dockerfile pins Tailscale 1.104.4. Before you upgrade Audiobookshelf, check its start command against the new image:
    ```sh
-   docker inspect ghcr.io/advplyr/audiobookshelf:<tag> --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}'
+   docker inspect ghcr.io/advplyr/audiobookshelf:<tag> --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}} {{json .Config.WorkingDir}}'
    ```
-   If the Cmd differs from `["node","index.js"]` (run from `/`), update the `CMD` line in the Dockerfile.
-3. **Base image OS.** The Dockerfile installs `fuse3`, `tini`, and `ca-certificates` with `apk` or `apt-get`, whichever the base image has. It fails the build on any other base image.
+   The Dockerfile's `CMD` must match. On 2.37.2 it is `["node", "dist-server/index.js"]`, run from `/app`. On 2.19.0 it was `["node", "index.js"]`, run from `/`.
+3. **Base image OS.** The Dockerfile installs `fuse3`, `tini`, and `ca-certificates` with `apk` or `apt-get`. It fails the build on any other base image.
+4. **Swap.** `swap_size_mb` must be a top-level key in `fly.toml`. Inside `[[vm]]`, Fly ignores it without an error. After a deploy, check the machine with `fly ssh console -C "free -m"`.
 
-## Operational notes
+## Operations
 
-- **One machine.** The volume is attached to a single machine, and Audiobookshelf uses an SQLite database, so don't scale beyond one machine.
-- **`auto_stop_machines` is off** so playback isn't interrupted. Set it to `"stop"` in `fly.toml` and `min_machines_running = 0` if you want to save money when idle, at the cost of a cold start.
-- **Cache behaviour.** The default `VFS_CACHE_MODE=off` streams every play from S3, so no audio is stored on the volume. This costs more S3 requests and bandwidth. Set `full` only if you want played books cached on the volume, and then size the volume to fit `VFS_CACHE_MAX_SIZE`.
-- **Reads from S3 cost money** on some providers (per request on S3, per download on B2 beyond the free tier). Cloudflare R2 has no egress fees.
-- **Updates.** Add new books to the bucket, then run **Scan** in Audiobookshelf. Directory listings are cached for `DIR_CACHE_TIME`, so new folders can take up to that long to appear.
+- **One machine only.** The volume attaches to a single machine, and Audiobookshelf uses SQLite, so don't scale beyond one machine.
+- **The machine stays on.** `min_machines_running = 1` and `auto_stop_machines = "off"` keep playback from being interrupted. To save money when idle, set `auto_stop_machines = "stop"` and `min_machines_running = 0`, at the cost of a cold start.
+- **Cache behavior.** With the default `VFS_CACHE_MODE=off`, every play streams from S3, so no audio is stored on the volume. This uses more S3 requests and bandwidth. Set `full` only if you want played books cached on the volume, and size the volume to fit `VFS_CACHE_MAX_SIZE`.
+- **S3 charges.** Some providers charge per request or per download. Cloudflare R2 has no egress fees.
+- **Adding books.** Upload new books to the bucket, then run **Scan** in Audiobookshelf. Directory listings are cached for `DIR_CACHE_TIME`, so new folders can take up to that long to appear.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Builds Audiobookshelf + rclone + FUSE + tini |
-| `start.sh` | Checks S3 access, mounts the bucket read-only, runs Audiobookshelf, handles shutdown |
-| `fly.toml` | Fly app config: volume, env, HTTP service, VM size |
-| `docker-compose.yml` | Local test rig with an rclone S3 stand-in |
+| `Dockerfile` | Builds Audiobookshelf with rclone, FUSE, tini, and Tailscale |
+| `start.sh` | Checks S3 access, mounts the bucket read-only, starts Tailscale, runs Audiobookshelf, handles shutdown |
+| `fly.toml` | Fly app config: region, volume, environment, VM size, and swap |
+| `docker-compose.yml` | Local test setup with an rclone S3 stand-in |
+| `.env.example` | Template for the environment variables. Copy to `.env` (git-ignored) |
+| `.github/workflows/docker-build.yml` | CI: lints `start.sh` and smoke-tests the image |
+| `AGENTS.md` | Guidance for AI agents working in this repo |
 | `.dockerignore` | Keeps secrets and git data out of the image |
