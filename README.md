@@ -3,8 +3,9 @@
 This repo wraps the public [Audiobookshelf](https://github.com/advplyr/audiobookshelf) image so that:
 
 - **Audiobooks stay in S3-compatible storage** (Cloudflare R2, Backblaze B2, Tigris, AWS S3, MinIO, ...). Nothing is copied at startup.
-- **The bucket is mounted read-only** at `/audiobooks` with rclone FUSE. The mount acts as the link: files are fetched from the bucket when they are played, and recently used files are kept in a bounded cache on the volume.
+- **The bucket is mounted read-only** at `/audiobooks` with rclone FUSE. The mount acts as the link: files are fetched from the bucket when they are played. By default nothing is cached on the volume (`VFS_CACHE_MODE=off`).
 - **Metadata and config live on one Fly volume** at `/data` (Audiobookshelf's database, covers, and settings).
+- **The app is private.** It has no public address and is reachable only over your Tailscale network.
 
 ## How it works
 
@@ -14,8 +15,8 @@ Fly machine
 └── start.sh
     ├── rclone lsf             checks the bucket, endpoint, and key before mounting
     ├── rclone mount (ro)      s3://bucket/[prefix]  ->  /audiobooks
-    │                          cache: /data/rclone-cache (bounded, on the volume)
-    └── node index.js          Audiobookshelf, reads /audiobooks and /data/*
+    ├── tailscaled + serve     joins the tailnet, forwards TCP :80 to the app
+    └── node dist-server/index.js   Audiobookshelf, reads /audiobooks and /data/*
 ```
 
 - **Read-only.** The mount is `--read-only`, and the S3 key only needs read access. Audiobookshelf cannot modify or delete your books.
@@ -27,7 +28,120 @@ Fly machine
 
 - Copying the bucket at boot would make start-up time grow with the library and need a volume as large as the whole library.
 - A symlink can't point at S3 by itself. Something has to present the bucket as a filesystem, and FUSE is that layer. The mount is the single "link" for the whole bucket, so no per-file links are needed.
-- Lazy reads plus a bounded cache give fast restarts, and the volume only holds what you have recently listened to.
+- Lazy reads give fast restarts, and the volume holds only the database, config, and covers.
+
+## System design
+
+### Architecture
+
+```mermaid
+flowchart LR
+    subgraph devices["Your devices (Tailscale installed)"]
+        phone["iPhone: Audiobookshelf app or Safari"]
+        mac["Mac: browser"]
+    end
+
+    subgraph fly["Fly machine: sin, shared-cpu-1x, 256 MB RAM + 512 MB swap"]
+        direction TB
+        start["start.sh (PID 1 via tini)"]
+        ts["tailscaled (userspace networking)"]
+        abs["Audiobookshelf :80"]
+        rclone["rclone mount, read-only, at /audiobooks"]
+        vol[("Fly volume /data, 1 GB<br/>database, config, covers")]
+    end
+
+    s3[("S3 bucket (Cloudflare R2)<br/>audio files, read-only key")]
+
+    phone -->|"WireGuard tunnel"| ts
+    mac -->|"WireGuard tunnel"| ts
+    ts -->|"TCP :80"| abs
+    start -.->|starts| ts
+    start -.->|starts| rclone
+    start -.->|starts| abs
+    abs -->|"reads files"| rclone
+    abs -->|"SQLite, covers"| vol
+    rclone -->|"S3 API: list, ranged GET"| s3
+```
+
+The machine has no public service and no public IP. The only way in is the Tailscale tunnel.
+
+### Startup
+
+```mermaid
+sequenceDiagram
+    participant F as Fly
+    participant S as start.sh
+    participant R as rclone
+    participant B as S3 bucket
+    participant T as tailscaled
+    participant A as Audiobookshelf
+
+    F->>S: start machine, attach volume at /data
+    S->>S: require S3 settings and TS_AUTHKEY, else exit
+    S->>R: rclone lsf, check access
+    R->>B: list bucket
+    B-->>R: entries or an error
+    R-->>S: ok, else exit with a clear message
+    S->>R: rclone mount, read-only, at /audiobooks
+    S->>S: unset the S3 credentials
+    S->>T: start tailscaled, tailscale up with TS_AUTHKEY
+    S->>T: serve reset, then forward TCP port 80 to 127.0.0.1:80
+    S->>A: node dist-server/index.js
+    Note over S,A: A watcher stops the app if the mount dies, so Fly restarts the machine
+```
+
+### Library scan
+
+```mermaid
+sequenceDiagram
+    actor U as You
+    participant A as Audiobookshelf
+    participant R as rclone mount
+    participant B as S3 bucket
+    participant V as Volume /data
+
+    U->>A: open the library, run Scan
+    A->>R: readdir /audiobooks
+    R->>B: ListObjectsV2, cached for DIR_CACHE_TIME
+    B-->>R: keys, sizes, dates
+    R-->>A: directory entries
+    A->>R: read file headers for tags, duration, cover
+    R->>B: GET with a Range header
+    B-->>R: partial bytes
+    R-->>A: bytes
+    A->>V: save titles, covers, durations in SQLite
+    A-->>U: books appear in the library
+```
+
+### Playback and seeking
+
+```mermaid
+sequenceDiagram
+    actor U as Player
+    participant A as Audiobookshelf
+    participant R as rclone mount
+    participant B as S3 bucket
+
+    U->>A: GET the audio file, Range bytes=N-
+    A->>R: read at offset N
+    R->>B: GET the object, Range bytes=N-
+    B-->>R: 206 stream
+    R-->>A: bytes
+    A-->>U: 206 Partial Content
+    Note over U,B: Seeking closes the stream and opens a new ranged GET at the new offset. With VFS_CACHE_MODE=off nothing is stored on disk.
+```
+
+The request shapes above are typical, not captured logs.
+
+### Where data lives
+
+| Data | Location | Survives a redeploy |
+|---|---|---|
+| Audio files | S3 bucket, read-only | Yes, never copied |
+| Database, config, covers | Fly volume `abs_data` at `/data` | Yes |
+| Tailscale node identity | Fly volume, `/data/tailscale` | Yes |
+| Swap | Separate device, 512 MB | Not needed |
+| S3 and Tailscale secrets | Fly secrets | Yes |
 
 ## Deploy to Fly.io
 
