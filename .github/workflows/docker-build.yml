@@ -42,7 +42,7 @@ jobs:
             command -v fusermount3 || command -v fusermount
             rclone version
             test -x /usr/local/bin/start.sh
-            test -f /index.js   # Audiobookshelf entry point (CMD runs it from /)
+            test -f /app/dist-server/index.js   # Audiobookshelf entry point (CMD runs it from /app)
             grep -q user_allow_other /etc/fuse.conf
           '
 
