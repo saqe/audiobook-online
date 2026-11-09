@@ -14,7 +14,7 @@ die() { printf '[start] ERROR: %s\n' "$*" >&2; exit 1; }
 : "${S3_ENDPOINT:?set S3_ENDPOINT, e.g. https://<account-id>.r2.cloudflarestorage.com}"
 : "${S3_ACCESS_KEY_ID:?set S3_ACCESS_KEY_ID}"
 : "${S3_SECRET_ACCESS_KEY:?set S3_SECRET_ACCESS_KEY}"
-: "${TS_AUTHKEY:?set TS_AUTHKEY (a Tailscale auth key). Without it the app is unreachable}"
+: "${CF_TUNNEL_TOKEN:?set CF_TUNNEL_TOKEN (a Cloudflare Tunnel token). Without it the app is unreachable}"
 [ "$#" -gt 0 ] || die "no command given to run after the mount"
 
 S3_PREFIX="${S3_PREFIX:-}"             # optional folder inside the bucket
@@ -25,6 +25,11 @@ CACHE_DIR="${CACHE_DIR:-/data/rclone-cache}"
 VFS_CACHE_MODE="${VFS_CACHE_MODE:-full}"
 VFS_CACHE_MAX_SIZE="${VFS_CACHE_MAX_SIZE:-5G}"
 DIR_CACHE_TIME="${DIR_CACHE_TIME:-5m}"
+# Stop the machine after this many minutes with nobody connected. 0 = never.
+IDLE_STOP_MINUTES="${IDLE_STOP_MINUTES:-0}"
+case "$IDLE_STOP_MINUTES" in
+  ''|*[!0-9]*) die "IDLE_STOP_MINUTES must be a whole number of minutes, got '$IDLE_STOP_MINUTES'" ;;
+esac
 
 # rclone reads its S3 settings from RCLONE_S3_* variables, so no rclone.conf is
 # needed. The ":s3:" path below is an on-the-fly remote built from them.
@@ -80,48 +85,39 @@ log "mounted $MOUNT_POINT"
 # so the application process does not inherit them.
 unset RCLONE_S3_ACCESS_KEY_ID RCLONE_S3_SECRET_ACCESS_KEY S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY
 
-# --- Tailscale: the app is reachable only from your tailnet -------------------
-# The Fly app has no public service, so the only way in is over Tailscale. Without
-# a key the app would run unreachable, so refuse to start.
-TS_HOSTNAME="${TS_HOSTNAME:-audiobookshelf}"
-TS_SOCK=/var/run/tailscale/tailscaled.sock
-TS_PID=""
-mkdir -p /var/run/tailscale /data/tailscale
-
-# Userspace networking needs no TUN device or extra capabilities. The node
-# identity lives on the volume, so a redeploy keeps the same tailnet machine.
-log "starting tailscaled (hostname $TS_HOSTNAME)"
-tailscaled --tun=userspace-networking --statedir=/data/tailscale --socket="$TS_SOCK" &
-TS_PID=$!
-i=0
-until [ -S "$TS_SOCK" ]; do
-  kill -0 "$TS_PID" 2>/dev/null || die "tailscaled exited during startup"
-  i=$((i + 1))
-  [ "$i" -gt 30 ] && die "timed out waiting for tailscaled"
-  sleep 1
-done
-tailscale --socket="$TS_SOCK" up --authkey="$TS_AUTHKEY" --hostname="$TS_HOSTNAME" \
-  || die "tailscale up failed. Check TS_AUTHKEY (expired or already used?)"
-# Serve the app on the tailnet only. Clear any serve config saved on the volume
-# first, because a leftover rule (HTTP or TCP) makes the next serve command fail.
-# TCP forwarding passes the request through unchanged, so the tailnet IP works too.
-tailscale --socket="$TS_SOCK" serve reset >/dev/null 2>&1 || true
-tailscale --socket="$TS_SOCK" serve --bg --tcp=80 tcp://127.0.0.1:80 \
-  || die "tailscale serve failed"
-log "tailnet: reachable as http://$TS_HOSTNAME (MagicDNS) on port 80"
-unset TS_AUTHKEY
+# --- Cloudflare Tunnel: the app is reachable only through Cloudflare Access ---
+# The Fly app has no public service. cloudflared makes an outbound connection to
+# Cloudflare, which forwards requests for your hostname to http://127.0.0.1:80.
+# Put a Cloudflare Access policy on that hostname so only you can open it. The
+# token is read from TUNNEL_TOKEN and removed from the environment right after.
+# Set CF_TUNNEL_DISABLED=1 to skip the tunnel (the local docker-compose test).
+CF_PID=""
+if [ "${CF_TUNNEL_DISABLED:-0}" = "1" ]; then
+  log "CF_TUNNEL_DISABLED=1: not starting cloudflared"
+else
+  log "starting cloudflared"
+  TUNNEL_TOKEN="$CF_TUNNEL_TOKEN" cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 run &
+  CF_PID=$!
+  sleep 2
+  kill -0 "$CF_PID" 2>/dev/null || die "cloudflared exited during startup. Check CF_TUNNEL_TOKEN."
+fi
+unset CF_TUNNEL_TOKEN
 
 APP_PID=""
 WATCH_PID=""
+IDLE_PID=""
+IDLE_FLAG=/tmp/idle-stop
+rm -f "$IDLE_FLAG"
 
 stop() {
   trap - TERM INT
   if [ -n "$WATCH_PID" ]; then kill "$WATCH_PID" 2>/dev/null || true; fi
+  if [ -n "$IDLE_PID" ]; then kill "$IDLE_PID" 2>/dev/null || true; fi
   if [ -n "$APP_PID" ]; then
     kill -TERM "$APP_PID" 2>/dev/null || true
     wait "$APP_PID" 2>/dev/null || true
   fi
-  if [ -n "$TS_PID" ]; then kill -TERM "$TS_PID" 2>/dev/null || true; fi
+  if [ -n "$CF_PID" ]; then kill -TERM "$CF_PID" 2>/dev/null || true; fi
   # SIGTERM makes rclone unmount cleanly before it exits.
   kill -TERM "$RCLONE_PID" 2>/dev/null || true
   wait "$RCLONE_PID" 2>/dev/null || true
@@ -132,18 +128,52 @@ log "starting: $*"
 "$@" &
 APP_PID=$!
 
-# If the mount dies, the app would be reading a dead directory. Stop it so the
-# machine restarts and remounts. This must start after APP_PID is set, because
+# If the mount or the tunnel dies, the app is unusable. Stop it so the machine
+# restarts and brings them back. This must start after APP_PID is set, because
 # the subshell copies variables when it is forked.
 (
-  while kill -0 "$RCLONE_PID" 2>/dev/null; do sleep 5; done
-  log "rclone mount stopped; stopping the application"
+  while kill -0 "$RCLONE_PID" 2>/dev/null && { [ -z "$CF_PID" ] || kill -0 "$CF_PID" 2>/dev/null; }; do
+    sleep 5
+  done
+  log "rclone mount or cloudflared stopped; stopping the application"
   kill -TERM "$APP_PID" 2>/dev/null || true
 ) &
 WATCH_PID=$!
 
+# Number of established TCP connections to port 80 (cloudflared -> Audiobookshelf).
+# Open pages and the socket.io websocket keep one open, so zero means nobody is
+# using the app. Reads /proc, so it needs no extra tools.
+active_conns() {
+  cat /proc/net/tcp /proc/net/tcp6 2>/dev/null \
+    | awk '$2 ~ /:0050$/ && $4 == "01" { n++ } END { print n + 0 }'
+}
+
+# Idle stop: after IDLE_STOP_MINUTES with no connections, shut down cleanly. The
+# flag file makes this exit 0, so Fly's "on-failure" restart policy leaves the
+# machine stopped. Wake it again with the Worker in wake/ (see README.md).
+if [ "$IDLE_STOP_MINUTES" -gt 0 ]; then
+  log "idle stop enabled: ${IDLE_STOP_MINUTES} min with no connections"
+  (
+    idle=0
+    limit=$((IDLE_STOP_MINUTES * 60))
+    while kill -0 "$APP_PID" 2>/dev/null; do
+      sleep 15
+      if [ "$(active_conns)" -eq 0 ]; then idle=$((idle + 15)); else idle=0; fi
+      if [ "$idle" -ge "$limit" ]; then
+        log "idle for ${IDLE_STOP_MINUTES} min; stopping the machine"
+        : > "$IDLE_FLAG"
+        kill -TERM "$APP_PID" 2>/dev/null || true
+        exit 0
+      fi
+    done
+  ) &
+  IDLE_PID=$!
+fi
+
 status=0
 wait "$APP_PID" || status=$?
 log "application exited with status $status"
+# An idle stop is a normal shutdown, not a failure.
+if [ -e "$IDLE_FLAG" ]; then status=0; fi
 stop
 exit "$status"

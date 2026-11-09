@@ -1,0 +1,11 @@
+# Cloudflare Worker that wakes the Fly machine. See README.md, "Sleep when idle".
+# Replace the domain. The secret is set with: npx wrangler secret put FLY_API_TOKEN
+name = "audiobookshelf-wake"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+# Same hostname as the tunnel's public hostname and the Access application.
+routes = [{ pattern = "books.example.com/*", zone_name = "example.com" }]
+
+[vars]
+FLY_APP = "saqib-audiobookshelf"

@@ -29,6 +29,8 @@ services:
       S3_BUCKET: audiobooks
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
+      CF_TUNNEL_TOKEN: unused-locally
+      CF_TUNNEL_DISABLED: "1"
     volumes:
       - abs-data:/data
     ports:
