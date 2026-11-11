@@ -16,7 +16,7 @@ You should get a reply within a week. Once a fix is ready, it is released and th
 
 This repo is a deployment wrapper. It contains no application code of its own. In scope:
 
-- `start.sh`: credential handling, the S3 mount, Tailscale setup, and process shutdown
+- `start.sh`: credential handling, the S3 mount, Cloudflare Tunnel setup, and process shutdown
 - `Dockerfile`: what gets installed, and with which privileges
 - `fly.toml` and `docker-compose.yml`: exposed ports, mounts, and defaults
 - the CI workflow in `.github/workflows/`
@@ -28,7 +28,7 @@ Bugs in the software this repo packages belong upstream:
 |---|---|
 | Audiobookshelf | https://github.com/advplyr/audiobookshelf/security |
 | rclone | https://github.com/rclone/rclone/security |
-| Tailscale | https://github.com/tailscale/tailscale/security |
+| cloudflared | https://github.com/cloudflare/cloudflared/security |
 | Fly.io platform | Fly.io's own security contact |
 
 If you aren't sure where a problem belongs, report it here and it will be passed on.
@@ -41,17 +41,18 @@ Only the latest commit on the default branch is supported. The images in `Docker
 
 What a deployment of this repo is meant to guarantee:
 
-- **No public address.** The Fly app has no HTTP service. It is reachable only from devices on the owner's Tailscale network.
+- **No public address.** The Fly app has no HTTP service and no open ports. It is reachable only through an outbound Cloudflare Tunnel, and Cloudflare Access checks every request against the owner's policy before it enters the tunnel.
 - **The library is read-only.** The bucket is mounted with `--read-only`, and the S3 key should allow only read and list on that bucket.
-- **Credentials are never committed.** S3 and Tailscale credentials live in Fly secrets. `.env` is ignored by both git and the Docker build.
+- **Credentials are never committed.** S3 credentials and the tunnel token live in Fly secrets. `.env` is ignored by both git and the Docker build.
 - **The app doesn't inherit credentials.** `start.sh` removes them from the environment before Audiobookshelf starts.
 
-Known limitation: Audiobookshelf currently runs as root in the container. A compromised Audiobookshelf process could therefore read the credentials from other processes through `/proc`, and could read the Tailscale node key on the volume.
+Known limitation: Audiobookshelf currently runs as root in the container. A compromised Audiobookshelf process could therefore read the credentials from other processes through `/proc`, including the tunnel token held by `cloudflared`. Anyone with the tunnel token can run a connector for the tunnel, so rotate it in the Cloudflare dashboard if you suspect a compromise.
 
 ## Hardening your deployment
 
 - Use a read-only S3 key scoped to the one bucket. See "Provider settings" in `README.md`.
-- Use a single-use, tagged Tailscale auth key, and restrict access to the tag with an ACL so only your own devices can reach the app.
+- Create the Cloudflare Access application before you add the tunnel's public hostname, so the app is never public. Allow only named emails, not "everyone".
+- Give each phone its own Access service token, and revoke it if the phone is lost.
 - Check that the Fly app has no public IPs: `fly ips list`.
 - Create the Audiobookshelf admin account right after the first deploy, and give it a strong password.
 - Keep the pinned image versions current.

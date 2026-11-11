@@ -1,12 +1,12 @@
 # Audiobookshelf on Fly.io, with audiobooks in S3
 
-This repo runs [Audiobookshelf](https://github.com/advplyr/audiobookshelf) on a small Fly.io machine. Your audiobooks stay in an S3 bucket and are never copied to the server. The app is private: only devices on your Tailscale network can open it.
+This repo runs [Audiobookshelf](https://github.com/advplyr/audiobookshelf) on a small Fly.io machine. Your audiobooks stay in an S3 bucket and are never copied to the server. The app is private: it's published through Cloudflare Tunnel, and Cloudflare Access lets in only the people you allow.
 
 ## How it fits together
 
 - **Audio stays in S3.** The bucket is mounted read-only at `/audiobooks`, so Audiobookshelf reads files as if they were on disk. Audio is streamed from S3 when played and is not stored on the server.
 - **The server keeps only small files.** Audiobookshelf's database, settings, and cover images live on a 1 GB Fly volume at `/data`.
-- **Access is private.** The app has no public address. Tailscale runs in the same container, and you reach the app through your tailnet.
+- **Access is private.** The Fly app has no public address. `cloudflared` runs in the same container and dials out to Cloudflare. Cloudflare Access checks who you are at Cloudflare's edge, before any request reaches the machine.
 
 ```
 Fly machine
@@ -14,7 +14,7 @@ Fly machine
 └── start.sh
     ├── rclone lsf                    checks the bucket, endpoint, and key
     ├── rclone mount (read-only)      S3 bucket  ->  /audiobooks
-    ├── tailscaled + serve            joins your tailnet, forwards port 80 to the app
+    ├── cloudflared tunnel run        outbound tunnel to Cloudflare, forwards to port 80
     └── node dist-server/index.js     Audiobookshelf
 ```
 
@@ -35,15 +35,19 @@ Fly machine
 
 ```mermaid
 flowchart LR
-    subgraph devices["Your devices (Tailscale installed)"]
+    subgraph devices["Your devices (no client install needed)"]
         phone["iPhone: Audiobookshelf app or Safari"]
         mac["Mac: browser"]
+    end
+
+    subgraph cf["Cloudflare edge"]
+        access["Cloudflare Access<br/>login + policy check"]
     end
 
     subgraph fly["Fly machine: sin, shared-cpu-1x, 256 MB RAM + 512 MB swap"]
         direction TB
         start["start.sh (PID 1 via tini)"]
-        ts["tailscaled (userspace networking)"]
+        cfd["cloudflared (outbound only)"]
         abs["Audiobookshelf :80"]
         rclone["rclone mount, read-only, at /audiobooks"]
         vol[("Fly volume /data, 1 GB<br/>database, config, covers")]
@@ -51,10 +55,12 @@ flowchart LR
 
     s3[("S3 bucket (Cloudflare R2)<br/>audio files, read-only key")]
 
-    phone -->|"WireGuard tunnel"| ts
-    mac -->|"WireGuard tunnel"| ts
-    ts -->|"TCP :80"| abs
-    start -.->|starts| ts
+    phone -->|"HTTPS"| access
+    mac -->|"HTTPS"| access
+    cfd ==>|"outbound tunnel"| access
+    access -->|"allowed requests only"| cfd
+    cfd -->|"HTTP :80"| abs
+    start -.->|starts| cfd
     start -.->|starts| rclone
     start -.->|starts| abs
     abs -->|"reads files"| rclone
@@ -62,7 +68,7 @@ flowchart LR
     rclone -->|"S3 API: list, ranged GET"| s3
 ```
 
-The machine has no public service and no public IP address. The only way in is through the Tailscale tunnel.
+The machine has no public service and no public IP address. `cloudflared` only makes outbound connections, so there is no open port to attack. Every request comes in through the tunnel, and Access has already checked it.
 
 ## Playback and seeking
 
@@ -90,9 +96,9 @@ The request shapes above are typical, not captured logs.
 |---|---|---|
 | Audio files | S3 bucket, read-only | Yes. Never copied. |
 | Database, settings, covers | Fly volume `abs_data`, mounted at `/data` | Yes |
-| Tailscale machine identity | Fly volume, `/data/tailscale` | Yes |
 | Swap | Separate device, 512 MB | Not needed |
-| S3 and Tailscale secrets | Fly secrets | Yes |
+| S3 secrets and tunnel token | Fly secrets | Yes |
+| Tunnel hostname and Access policy | Cloudflare Zero Trust dashboard | Yes |
 
 ## Deploy to Fly.io
 
@@ -131,9 +137,9 @@ fly secrets set \
 
 Set `S3_PROVIDER` and `S3_REGION` in `fly.toml` to match your provider. To mount only one folder of the bucket, set `S3_PREFIX`.
 
-### 4. Set up Tailscale, then deploy
+### 4. Set up Cloudflare Tunnel and Access, then deploy
 
-Follow [Private access with Tailscale](#private-access-with-tailscale) first, then run:
+Follow [Private access with Cloudflare](#private-access-with-cloudflare) first, then run:
 
 ```sh
 fly deploy
@@ -141,7 +147,7 @@ fly deploy
 
 ### 5. Create the admin account and add a library
 
-Open the app from a device on your tailnet (see [Private access](#private-access-with-tailscale)). Create the admin account, then add a library:
+Open `https://<your-hostname>/` and sign in through Cloudflare Access (see [Private access](#private-access-with-cloudflare)). Create the admin account, then add a library:
 
 - **Folder:** `/audiobooks`
 - **Watch for changes:** off, if your version shows this option. Changes in S3 don't trigger filesystem events, so use **Scan** instead.
@@ -174,23 +180,52 @@ Use a read-only key:
 - **Backblaze B2:** an application key limited to the bucket, with read-only capabilities.
 - **AWS:** an IAM policy with `s3:GetObject` and `s3:ListBucket`.
 
-## Private access with Tailscale
+## Private access with Cloudflare
 
-Only devices signed in to your tailnet can reach the app. `start.sh` refuses to start without a Tailscale key, so the app never runs unreachable.
+The app is published on a hostname in your Cloudflare zone, for example `books.example.com`. Cloudflare Access sits in front of it, so only people who match your policy can load it. `start.sh` refuses to start without a tunnel token, so the app never runs unreachable.
 
-1. **Create an auth key.** In the Tailscale admin console, go to **Settings → Keys → Generate auth key**. A single-use key is enough. The machine keeps its identity on the volume (`/data/tailscale`), so redeploys reuse it.
-2. **Store the key as a Fly secret.** Don't put it in the repo, `fly.toml`, the Dockerfile, or GitHub:
+Do these in the [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/). You need a domain on Cloudflare.
+
+1. **Create the Access application first**, so the hostname is never public, even for a moment. Go to **Access → Applications → Add an application → Self-hosted**.
+   - **Domain:** `books.example.com`
+   - **Policy:** action **Allow**, include **Emails** with your own address (or **Emails ending in** your domain). Add more emails for family members.
+   - **Login methods:** One-time PIN works with no setup. Google or GitHub also work if you've added them under **Settings → Authentication**.
+   - **Session duration:** a long one, such as 1 month, so the player isn't sent back to the login page often.
+2. **Create the tunnel.** Go to **Networks → Tunnels → Create a tunnel → Cloudflared**, and name it `audiobookshelf`. Copy the token from the install command (the long string after `--token`). Skip the connector install step, because the container runs `cloudflared` itself.
+3. **Add the public hostname** to the tunnel: subdomain `books`, your domain, service type **HTTP**, URL **`localhost:80`**. Cloudflare creates the DNS record for you.
+4. **Store the token as a Fly secret.** Don't put it in the repo, `fly.toml`, the Dockerfile, or GitHub:
    ```sh
-   fly secrets set TS_AUTHKEY=tskey-auth-...
+   fly secrets set --stage TUNNEL_TOKEN=eyJ...
    ```
-3. **Connect a device.** Install Tailscale on your phone or laptop, sign in to the same tailnet, and keep it connected.
-4. **Open the app** at the machine's MagicDNS name, for example `http://audiobookshelf.<your-tailnet>.ts.net/`. If the name doesn't resolve on a device, use the machine's Tailscale IP address (`tailscale status` lists it).
+5. **Deploy** with `fly deploy`, then open `https://books.example.com/`. Cloudflare shows its login page first, then Audiobookshelf.
 
-With Tailscale disconnected, the app can't be reached from the internet.
+### The Audiobookshelf phone app
+
+The phone app can't show the Access login page, so give it a service token instead:
+
+1. In Zero Trust, go to **Access → Service credentials → Service Tokens → Create Service Token**. Copy the Client ID and Client Secret.
+2. In the Access application, add a second policy: action **Service Auth**, include **Service Token** set to that token.
+3. In the phone app, when you add the server, open the advanced options and add two custom headers: `CF-Access-Client-Id` and `CF-Access-Client-Secret`, set to the values from step 1. If your app version doesn't offer custom headers, use the web player in Safari instead.
+
+A service token works without a login, so treat it like a password. Revoke it in the dashboard if a phone is lost.
 
 **Checks:**
-- `fly logs` should show `tailnet: reachable as http://audiobookshelf`.
-- If the key is expired or already used, `start.sh` exits with `tailscale up failed`. Create a new key and run `fly secrets set TS_AUTHKEY=...` again.
+- `fly logs` should show `[start] tunnel: connected to Cloudflare`, and the tunnel shows **Healthy** in the dashboard.
+- If the token is wrong, `start.sh` exits with `cloudflared exited during startup. Check TUNNEL_TOKEN`.
+- In a private browser window, `https://books.example.com/` should show the Cloudflare Access login page, not Audiobookshelf.
+
+### Moving from Tailscale
+
+Earlier versions of this repo used Tailscale. To switch an existing deployment:
+
+1. Do steps 1–4 above.
+2. Stage the removal of the old key, then deploy, so the machine restarts only once:
+   ```sh
+   fly secrets unset --stage TS_AUTHKEY
+   fly deploy
+   ```
+3. Delete the old machine from the Tailscale admin console (**Machines**).
+4. Optionally, remove the old Tailscale state from the volume: `fly ssh console -C "rm -rf /data/tailscale"`.
 
 ## Configuration
 
@@ -202,8 +237,7 @@ Set credentials as Fly secrets. Set everything else in `fly.toml` under `[env]`.
 | `S3_BUCKET` | yes | | Bucket name |
 | `S3_ACCESS_KEY_ID` | yes | | Read-only key ID (secret) |
 | `S3_SECRET_ACCESS_KEY` | yes | | Read-only key secret (secret) |
-| `TS_AUTHKEY` | yes | | Tailscale auth key (secret) |
-| `TS_HOSTNAME` | no | `audiobookshelf` | Machine name on your tailnet |
+| `TUNNEL_TOKEN` | yes | | Cloudflare Tunnel token (secret) |
 | `S3_PROVIDER` | no | `Other` | rclone provider name (see the table above) |
 | `S3_REGION` | no | `auto` | Region |
 | `S3_PREFIX` | no | (bucket root) | Mount only this folder of the bucket |
@@ -237,7 +271,7 @@ Open http://localhost:8080 and add `/audiobooks` as a library. Local testing nee
    fly logs    # look for: [start] mounted /audiobooks
    ```
    If the mount fails, the startup script exits with a clear error. The fallback is to sync the bucket to the volume, which is slower to start and needs a volume as large as the library.
-2. **Image versions.** The Dockerfile and `fly.toml` pin Audiobookshelf 2.37.2, rclone 1.76.0, and Tailscale 1.104.4, each by tag and digest (`image:tag@sha256:...`). Docker pulls by the digest, so a re-pushed tag can't change the build. To upgrade, get the new digest with `docker buildx imagetools inspect <image>:<tag>`, then update it in the Dockerfile, `fly.toml`, and, for rclone, `docker-compose.yml`. Before you upgrade Audiobookshelf, check its start command against the new image:
+2. **Image versions.** The Dockerfile and `fly.toml` pin Audiobookshelf 2.37.2, rclone 1.76.0, and cloudflared 2026.10.7, each by tag and digest (`image:tag@sha256:...`). Docker pulls by the digest, so a re-pushed tag can't change the build. To upgrade, get the new digest with `docker buildx imagetools inspect <image>:<tag>`, then update it in the Dockerfile, `fly.toml`, and, for rclone, `docker-compose.yml`. Before you upgrade Audiobookshelf, check its start command against the new image:
    ```sh
    docker inspect ghcr.io/advplyr/audiobookshelf:<tag> --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}} {{json .Config.WorkingDir}}'
    ```
@@ -257,8 +291,8 @@ Open http://localhost:8080 and add `/audiobooks` as a library. Local testing nee
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Builds Audiobookshelf with rclone, FUSE, tini, and Tailscale |
-| `start.sh` | Checks S3 access, mounts the bucket read-only, starts Tailscale, runs Audiobookshelf, handles shutdown |
+| `Dockerfile` | Builds Audiobookshelf with rclone, FUSE, tini, and cloudflared |
+| `start.sh` | Checks S3 access, mounts the bucket read-only, starts Cloudflare Tunnel, runs Audiobookshelf, handles shutdown |
 | `fly.toml` | Fly app config: region, volume, environment, VM size, and swap |
 | `docker-compose.yml` | Local test setup with an rclone S3 stand-in |
 | `.env.example` | Template for the environment variables. Copy to `.env` (git-ignored) |

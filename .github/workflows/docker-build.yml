@@ -37,8 +37,8 @@ jobs:
             set -e
             command -v rclone
             command -v tini
-            command -v tailscale
-            command -v tailscaled
+            command -v cloudflared
+            cloudflared --version
             command -v fusermount3 || command -v fusermount
             rclone version
             test -x /usr/local/bin/start.sh
