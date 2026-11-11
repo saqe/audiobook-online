@@ -45,7 +45,8 @@ Do not run `fly deploy` or change Fly secrets unless the user asks. Those affect
 - Keep `start.sh` POSIX-compatible `sh` unless there is a reason to change it. The Dockerfile supports base images with either `apk` or `apt-get`.
 - Fail fast with a clear message. Startup should exit on a bad endpoint, bucket, prefix, or key rather than start with an empty library.
 - The S3 mount must stay read-only (`--read-only`). Don't add write paths to the bucket.
-- Unset S3 credentials in the environment before starting Audiobookshelf, so the app never sees them.
+- Unset S3 credentials and `TUNNEL_TOKEN` in the environment before starting Audiobookshelf, so the app never sees them.
+- Access is through Cloudflare Tunnel plus Cloudflare Access only. Don't add an `[http_service]` or public IPs to `fly.toml`.
 - Pin image versions (`fly.toml`, `docker-compose.yml`). Don't switch to `latest`.
 - Keep config values in `fly.toml` `[env]` and credentials in Fly secrets. Never commit credentials.
 
@@ -58,6 +59,6 @@ Do not run `fly deploy` or change Fly secrets unless the user asks. Those affect
 
 ## Git
 
-- Current working branch: `claude/audiobook-docker-s3-storage-stbf9q`. `main` is the PR base.
+- Current working branch: `feat-cloudflare-tunnel-access`. `main` is the PR base.
 - Don't commit or push unless the user asks.
 - A PR from a branch with no commits beyond `main` will be refused by GitHub, so new work needs its own branch.
