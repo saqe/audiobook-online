@@ -59,6 +59,6 @@ Do not run `fly deploy` or change Fly secrets unless the user asks. Those affect
 
 ## Git
 
-- Current working branch: `saqe/cloudflare-tunnel-access`. `main` is the PR base.
+- Current working branch: `feat-cloudflare-tunnel-access`. `main` is the PR base.
 - Don't commit or push unless the user asks.
 - A PR from a branch with no commits beyond `main` will be refused by GitHub, so new work needs its own branch.
