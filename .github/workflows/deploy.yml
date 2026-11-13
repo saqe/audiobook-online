@@ -1,0 +1,106 @@
+name: Deploy to production
+
+# Manual deploy. Run it from the Actions tab ("Run workflow") and type the branch
+# to deploy. The workflow file itself is always read from the default branch.
+#
+# On success it records a GitHub deployment for that branch in the `production`
+# environment. That makes the branch's PR show "deployed to production", and
+# GitHub marks the previous deployment inactive, so only one branch shows as live.
+# It also posts (or updates) a comment on the PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to deploy to production
+        required: true
+        default: main
+        type: string
+
+# One deploy at a time. Never cancel a deploy that is already running.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+  pull-requests: write
+
+env:
+  # Passed through env, never interpolated into scripts, so a branch name can't inject shell.
+  BRANCH: ${{ inputs.branch }}
+  GH_TOKEN: ${{ github.token }}
+  FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.branch }}
+    runs-on: ubuntu-latest
+    # Add required reviewers to this environment in Settings > Environments
+    # to get an approval step before every deploy.
+    environment: production
+    steps:
+      - name: Check the deploy token is set
+        run: test -n "$FLY_API_TOKEN" || { echo "::error::Secret FLY_API_TOKEN is not set"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Record the commit being deployed
+        run: |
+          echo "SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Deploying $BRANCH at $(git rev-parse --short HEAD)"
+
+      # Same checks as the Docker build workflow, so a broken branch never reaches prod.
+      - name: Check start.sh
+        run: |
+          sh -n start.sh
+          shellcheck start.sh
+
+      - uses: superfly/flyctl-actions/setup-flyctl@1.5
+
+      - name: Validate fly.toml
+        run: flyctl config validate
+
+      - name: Open a GitHub deployment for the branch
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/deployments" \
+            -f ref="$SHA" -f environment=production \
+            -f description="Deploy $BRANCH" \
+            -F auto_merge=false -F required_contexts[]= -F production_environment=true \
+            --jq .id)
+          echo "DEPLOYMENT_ID=$id" >> "$GITHUB_ENV"
+
+      - name: Deploy to Fly
+        run: flyctl deploy --remote-only
+
+      - name: Mark the deployment as successful
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/deployments/$DEPLOYMENT_ID/statuses" \
+            -f state=success -f environment=production \
+            -f log_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Mark the deployment as failed
+        if: failure() && env.DEPLOYMENT_ID != ''
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/deployments/$DEPLOYMENT_ID/statuses" \
+            -f state=failure -f environment=production \
+            -f log_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Comment on the PR
+        if: success()
+        run: |
+          pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          [ -n "$pr" ] || { echo "No open PR for $BRANCH, skipping comment"; exit 0; }
+          marker='<!-- prod-deploy -->'
+          body="$marker
+          **Deployed to production:** \`$BRANCH\` at \`${SHA:0:7}\` ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))"
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$pr/comments" \
+            --jq "[.[] | select(.body | startswith(\"$marker\"))][0].id // empty")
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -f body="$body"
+          else
+            gh pr comment "$pr" --body "$body"
+          fi
